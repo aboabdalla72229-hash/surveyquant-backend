@@ -30,7 +30,7 @@ const LATEST_APP_VERSION_NAME =
   process.env.LATEST_APP_VERSION_NAME || '1.0.93';
 const UPDATE_URL =
   process.env.UPDATE_URL ||
-  'https://aboabdalla72229-hash.github.io/surveyquant-website/';
+  'https://github.com/aboabdalla72229-hash/SurveyQuantAndroid_v1.0.57/releases/download/v1.0.93/SurveyQuant_v1.0.93.apk';
 
 const PLANS = {
   monthly: { amount: 55, days: 30, label: 'شهري' },
