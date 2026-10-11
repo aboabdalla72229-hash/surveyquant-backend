@@ -1,0 +1,58 @@
+name: Update SurveyQuant Backend APK URL to v1.0.93
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout backend repository
+        uses: actions/checkout@v4
+
+      - name: Update fallback APK URL safely
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("server.js")
+          if not path.exists():
+              raise SystemExit("ERROR: server.js not found in repository root.")
+
+          content = path.read_text(encoding="utf-8")
+          old = "process.env.UPDATE_URL ||\n  'https://aboabdalla72229-hash.github.io/surveyquant-website/';"
+          new = "process.env.UPDATE_URL ||\n  'https://github.com/aboabdalla72229-hash/SurveyQuantAndroid_v1.0.57/releases/download/v1.0.93/SurveyQuant_v1.0.93.apk';"
+
+          if new in content:
+              print("The fallback APK URL is already set to v1.0.93; no source change needed.")
+          elif old in content:
+              content = content.replace(old, new, 1)
+              path.write_text(content, encoding="utf-8")
+              print("Updated fallback APK URL to v1.0.93.")
+          else:
+              raise SystemExit("ERROR: UPDATE_URL fallback did not match the expected source. No automatic edit was made.")
+
+          if "SurveyQuant_v1.0.93.apk" not in content:
+              raise SystemExit("ERROR: Verification failed; v1.0.93 APK URL is missing.")
+          if "process.env.MINIMUM_APP_VERSION_CODE || 93" not in content:
+              raise SystemExit("ERROR: The default minimum version is not 93; refusing to commit an unexpected source state.")
+          if "process.env.LATEST_APP_VERSION_NAME || '1.0.93'" not in content:
+              raise SystemExit("ERROR: The default latest version is not 1.0.93; refusing to commit an unexpected source state.")
+          PY
+
+      - name: Commit source update
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js
+          if git diff --cached --quiet; then
+            echo "No source changes to commit."
+            exit 0
+          fi
+          git commit -m "Set backend fallback APK URL to v1.0.93"
+          git push
