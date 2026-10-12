@@ -24,6 +24,35 @@ const KASHIER_MID = process.env.KASHIER_MID || '';
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
 
 const TRIAL_DAYS = 3;
+// Only exact device IDs listed in Railway's SURVEYQUANT_OWNER_DEVICE_IDS are exempt.
+const OWNER_DEVICE_IDS = new Set(
+  (process.env.SURVEYQUANT_OWNER_DEVICE_IDS || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean)
+);
+const OWNER_ACCESS_UNTIL = '2099-12-31T23:59:59.000Z';
+
+function isOwnerDevice(deviceId) {
+  return OWNER_DEVICE_IDS.has(String(deviceId || '').trim());
+}
+
+function accessPayload(user, deviceId) {
+  const ownerExempt = isOwnerDevice(deviceId);
+  const now = Date.now();
+  return {
+    ...user,
+    ownerExempt,
+    trialActive:
+      ownerExempt ||
+      (!!user.trialUntil && new Date(user.trialUntil).getTime() > now),
+    subscriptionActive:
+      ownerExempt ||
+      (!!user.activeUntil && new Date(user.activeUntil).getTime() > now),
+    trialUntil: ownerExempt ? OWNER_ACCESS_UNTIL : user.trialUntil,
+    activeUntil: ownerExempt ? OWNER_ACCESS_UNTIL : user.activeUntil
+  };
+}
 const MINIMUM_APP_VERSION_CODE =
   Number(process.env.MINIMUM_APP_VERSION_CODE || 93);
 const LATEST_APP_VERSION_NAME =
@@ -69,7 +98,18 @@ function enforceTrialDuration(user) {
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
+app.get('/', (_req, res) => {
+  res.set('X-SurveyQuant-Backend', 'owner-device-allowlist-v1');
+  res.json({
+    ok: true,
+    service: 'SurveyQuant backend',
+    revision: 'owner-device-allowlist-v1',
+    endpoints: ['/health', '/api/config', '/api/register', '/api/status/:deviceId']
+  });
+});
+
 app.get('/api/config', (req, res) => {
+  res.set('X-SurveyQuant-Backend', 'owner-device-allowlist-v1');
   res.json({
     paymentProvider: 'Kashier',
     mode: KASHIER_MODE,
@@ -109,13 +149,25 @@ app.post('/api/register', (req, res) => {
 
   enforceTrialDuration(data.users[key]);
   write(data);
-  res.json(data.users[key]);
+  res.json(accessPayload(data.users[key], normalizedId));
 });
 
 app.get('/api/status/:deviceId', (req, res) => {
   const data = read();
   const deviceId = decodeURIComponent(req.params.deviceId);
-  const user = data.users['device:' + deviceId];
+  const key = 'device:' + deviceId;
+  let user = data.users[key];
+
+  if (!user && isOwnerDevice(deviceId)) {
+    user = data.users[key] = {
+      id: crypto.randomUUID(),
+      name: '',
+      deviceId,
+      createdAt: new Date().toISOString(),
+      trialUntil: new Date(Date.now() + TRIAL_DAYS * 86400000).toISOString(),
+      activeUntil: null
+    };
+  }
 
   if (!user) {
     return res.status(404).json({ error: 'المستخدم غير موجود' });
@@ -123,16 +175,7 @@ app.get('/api/status/:deviceId', (req, res) => {
 
   enforceTrialDuration(user);
   write(data);
-
-  const now = Date.now();
-
-  res.json({
-    ...user,
-    trialActive:
-      !!user.trialUntil && new Date(user.trialUntil).getTime() > now,
-    subscriptionActive:
-      !!user.activeUntil && new Date(user.activeUntil).getTime() > now
-  });
+  res.json(accessPayload(user, deviceId));
 });
 
 function requireKashierConfig() {
@@ -151,8 +194,6 @@ function requireKashierConfig() {
 }
 app.post('/api/kashier/create-session', async (req, res) => {
   try {
-    requireKashierConfig();
-
     const { deviceId, plan } = req.body || {};
     const normalizedId = String(deviceId || '').trim();
     const key = 'device:' + normalizedId;
@@ -164,6 +205,17 @@ app.post('/api/kashier/create-session', async (req, res) => {
       });
     }
 
+    if (isOwnerDevice(normalizedId)) {
+      return res.status(403).json({
+        error: 'هذا الجهاز مستثنى من الاشتراك والدفع',
+        ownerExempt: true,
+        trialActive: true,
+        subscriptionActive: true,
+        activeUntil: OWNER_ACCESS_UNTIL
+      });
+    }
+
+    requireKashierConfig();
     const data = read();
 
     if (!data.users[key]) {
@@ -274,6 +326,16 @@ app.post('/api/kashier/create-session', async (req, res) => {
 app.get('/api/kashier/status', (req, res) => {
   const deviceId = String(req.query.deviceId || '').trim();
   const order = String(req.query.order || '').trim();
+
+  if (isOwnerDevice(deviceId)) {
+    return res.json({
+      paymentStatus: 'OWNER_EXEMPT',
+      transactionId: null,
+      subscriptionActive: true,
+      ownerExempt: true,
+      activeUntil: OWNER_ACCESS_UNTIL
+    });
+  }
 
   const data = read();
   const payment = data.payments[order];
@@ -408,8 +470,11 @@ app.get('/api/kashier/return', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
+  res.set('X-SurveyQuant-Backend', 'owner-device-allowlist-v1');
   res.json({
     ok: true,
+    service: 'SurveyQuant backend',
+    revision: 'owner-device-allowlist-v1',
     provider: 'Kashier',
     mode: KASHIER_MODE
   });
