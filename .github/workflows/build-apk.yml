@@ -1,40 +1,80 @@
-name: Build SurveyQuant APK
+
+name: Repair SurveyQuant Railway source
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  reconnect:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+      - name: Check Railway API token
+        shell: bash
+        env:
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+        run: |
+          if [ -z "$RAILWAY_API_TOKEN" ]; then
+            echo "::error::Missing RAILWAY_API_TOKEN secret."
+            echo "Add the token in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          echo "Railway token is configured."
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.7'
+      - name: Connect the existing backend service
+        shell: bash
+        env:
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+        run: |
+          railway service source connect \
+            --repo aboabdalla72229-hash/surveyquant-backend \
+            --branch main \
+            --service d2bd10f3-2031-4f06-b847-2687776a5ab9 \
+            --project 56813f6c-865b-46aa-b9e4-e15094f4b1a0 \
+            --environment f691318a-9c83-44ae-a23b-5a3dc9b62a01
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Check backend health
+        shell: bash
+        run: |
+          url="https://surveyquant-backend-production.up.railway.app/health"
 
-      - name: Install Android SDK 33
-        run: sdkmanager "platforms;android-33" "build-tools;33.0.2"
+          for attempt in $(seq 1 36); do
+            body="$(curl -sS --max-time 10 "$url" || true)"
 
-      - name: Build APK
-        run: gradle --no-daemon :app:assembleDebug
+            if echo "$body" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'; then
+              echo "Backend is healthy:"
+              echo "$body"
+              exit 0
+            fi
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: SurveyQuant-v33-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+            echo "Waiting for backend deployment ($attempt/36)..."
+            sleep 10
+          done
+
+          echo "::error::Backend health check failed. Review Railway deployment logs."
+          exit 1
+
+      - name: Verify owner device access
+        shell: bash
+        run: |
+          url="https://surveyquant-backend-production.up.railway.app/api/status/SQ-3149eb5486b3ea3d"
+          body="$(curl -sS --max-time 15 "$url" || true)"
+
+          echo "Owner device status:"
+          echo "$body"
+
+          if echo "$body" | grep -Eq '"ownerExempt"[[:space:]]*:[[:space:]]*true' &&
+             echo "$body" | grep -Eq '"trialActive"[[:space:]]*:[[:space:]]*true' &&
+             echo "$body" | grep -Eq '"subscriptionActive"[[:space:]]*:[[:space:]]*true'; then
+            echo "Owner device access verified."
+          else
+            echo "::error::Owner access was not confirmed. Check SURVEYQUANT_OWNER_DEVICE_IDS in Railway Variables."
+            exit 1
+          fi
