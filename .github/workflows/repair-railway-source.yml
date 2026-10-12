@@ -1,0 +1,63 @@
+name: Repair SurveyQuant Railway source and verify owner access
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconnect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Reconnect the existing Railway service to this GitHub repository
+        env:
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "$RAILWAY_API_TOKEN" ]; then
+            echo "::error::Missing RAILWAY_API_TOKEN secret. Add a Railway Workspace API token under GitHub Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          railway service source connect \
+            --repo aboabdalla72229-hash/surveyquant-backend \
+            --branch main \
+            --service d2bd10f3-2031-4f06-b847-2687776a5ab9 \
+            --project 56813f6c-865b-46aa-b9e4-e15094f4b1a0 \
+            --environment f691318a-9c83-44ae-a23b-5a3dc9b62a01
+
+      - name: Wait for the backend health endpoint
+        shell: bash
+        run: |
+          url="https://surveyquant-backend-production.up.railway.app/health"
+          for attempt in $(seq 1 36); do
+            body="$(curl --silent --show-error --max-time 10 "$url" || true)"
+            if echo "$body" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'; then
+              echo "Backend is responding:"
+              echo "$body"
+              exit 0
+            fi
+            echo "Backend not healthy yet (attempt $attempt/36)."
+            sleep 10
+          done
+          echo "::error::The source command finished, but /health did not return ok:true within 6 minutes. Check Railway deployment logs."
+          exit 1
+
+      - name: Verify owner device activation
+        shell: bash
+        run: |
+          url="https://surveyquant-backend-production.up.railway.app/api/status/SQ-3149eb5486b3ea3d"
+          body="$(curl --silent --show-error --max-time 15 "$url" || true)"
+          echo "$body"
+          if echo "$body" | grep -Eq '"ownerExempt"[[:space:]]*:[[:space:]]*true' && \
+             echo "$body" | grep -Eq '"trialActive"[[:space:]]*:[[:space:]]*true' && \
+             echo "$body" | grep -Eq '"subscriptionActive"[[:space:]]*:[[:space:]]*true'; then
+            echo "Owner device access verified."
+          else
+            echo "::error::Backend is online, but owner exemption was not confirmed. In Railway Variables, set SURVEYQUANT_OWNER_DEVICE_IDS to SQ-3149eb5486b3ea3d (keep any other existing IDs comma-separated), then redeploy."
+            exit 1
+          fi
