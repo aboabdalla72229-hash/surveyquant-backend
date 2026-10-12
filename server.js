@@ -1,3 +1,5 @@
+'use strict';
+
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -5,376 +7,155 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = Number(process.env.PORT || 8080);
 
-// التخزين الدائم: قم بتعيين مسار تركيب وحدة تخزين السكك الحديدية إلى /app/data.
+// Keep subscription/payment records on Railway's mounted persistent volume.
 const DATA_DIR = process.env.SURVEYQUANT_DATA_DIR || '/app/data';
 const DATA = path.join(DATA_DIR, 'data.json');
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const KASHIER_MODE =
-  (process.env.KASHIER_MODE || 'test').toLowerCase() === 'live'
-    ؟ 'يعيش'
-    : 'امتحان'؛
-
+  String(process.env.KASHIER_MODE || 'test').toLowerCase() === 'live'
+    ? 'live'
+    : 'test';
 const KASHIER_API_BASE =
   KASHIER_MODE === 'live'
-    ؟ 'https://api.kashier.io'
+    ? 'https://api.kashier.io'
     : 'https://test-api.kashier.io';
-
-// تستخدم عمليات استرداد الأموال نقطة نهاية Kashier FEP منفصلة عن إنشاء جلسة الدفع.
 const KASHIER_REFUND_API_BASE =
   KASHIER_MODE === 'live'
-    ؟ 'https://fep.kashier.io'
+    ? 'https://fep.kashier.io'
     : 'https://test-fep.kashier.io';
 
 const KASHIER_API_KEY = process.env.KASHIER_API_KEY || '';
 const KASHIER_SECRET_KEY = process.env.KASHIER_SECRET_KEY || '';
 const KASHIER_MID = process.env.KASHIER_MID || '';
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
 const TRIAL_DAYS = 3;
 
-// استثنِ فقط معرّفات الأجهزة المحددة التي تم تكوينها في Railway.
+// Only explicitly listed device IDs are exempt from payment.
 const OWNER_DEVICE_IDS = new Set(
-  (process.env.SURVEYQUANT_OWNER_DEVICE_IDS || '')
-    .ينقسم('،')
+  String(process.env.SURVEYQUANT_OWNER_DEVICE_IDS || '')
+    .split(',')
     .map(value => value.trim())
     .filter(Boolean)
 );
 const OWNER_ACCESS_UNTIL = '2099-12-31T23:59:59.000Z';
-
-دالة isOwnerDevice(deviceId) {
-  return OWNER_DEVICE_IDS.has(String(deviceId || '').trim());
-}
-
-دالة الوصول إلى الحمولة (المستخدم، معرف الجهاز) {
-  const ownerExempt = isOwnerDevice(deviceId);
-  const now = Date.now();
-  يعود {
-    ...مستخدم،
-    المالك المعفى،
-    تجريبي نشط:
-      ownerExempt || (!!user.trialUntil && new Date(user.trialUntil).getTime() > now),
-    الاشتراك نشط:
-      ownerExempt || (!!user.activeUntil && new Date(user.activeUntil).getTime() > now),
-    trialUntil: ownerExempt ? OWNER_ACCESS_UNTIL : user.trialUntil,
-    activeUntil: ownerExempt ? OWNER_ACCESS_UNTIL : user.activeUntil
-  };
-}
-
 const MINIMUM_APP_VERSION_CODE = Number(process.env.MINIMUM_APP_VERSION_CODE || 93);
 const LATEST_APP_VERSION_NAME = process.env.LATEST_APP_VERSION_NAME || '1.0.93';
-const UPDATE_URL =
-  process.env.UPDATE_URL ||
+const UPDATE_URL = process.env.UPDATE_URL ||
   'https://github.com/aboabdalla72229-hash/SurveyQuantAndroid_v1.0.57/releases/download/v1.0.93/SurveyQuant_v1.0.93.apk';
 
 const PLANS = {
-  شهريًا: { المبلغ: 55، الأيام: 30، التسمية: 'ط´ظ‡ط±ظٹ' },
-  ربع سنوي: { المبلغ: 150، الأيام: 90، التسمية: '3 ط´ظ‡ظˆط±' },
-  سنويًا: { المبلغ: 500، الأيام: 365، التصنيف: 'ط³ظ†ظˆظٹ' }
+  monthly: { amount: 55, days: 30, label: 'شهري' },
+  quarterly: { amount: 150, days: 90, label: '3 شهور' },
+  yearly: { amount: 500, days: 365, label: 'سنوي' }
 };
 
-// تأكد من وجود الدليل الدائم وملف JSON الأولي قبل وصول الطلبات.
-fs.mkdirSync(DATA_DIR, { recursive: true });
-إذا لم تكن البيانات متزامنة في نظام الملفات (fs.existsSync(DATA)) {
-  fs.writeFileSync(
-    بيانات،
-    JSON.stringify({ users: {}, payments: {}, webhookEvents: {} }, null, 2),
-    'utf8'
-  );
+function emptyStore() {
+  return { users: {}, payments: {}, webhookEvents: {} };
 }
 
-const read = () => JSON.parse(fs.readFileSync(DATA, 'utf8'));
-const write = data => fs.writeFileSync(DATA, JSON.stringify(data, null, 2), 'utf8');
+if (!fs.existsSync(DATA)) {
+  fs.writeFileSync(DATA, JSON.stringify(emptyStore(), null, 2), 'utf8');
+}
 
-دالة فرض مدة التجربة (المستخدم) {
-  إذا لم يكن المستخدم موجودًا أو لم يتم إنشاؤه في تاريخ محدد، فقم بالخروج.
+function readStore() {
+  const parsed = JSON.parse(fs.readFileSync(DATA, 'utf8'));
+  if (!parsed.users) parsed.users = {};
+  if (!parsed.payments) parsed.payments = {};
+  if (!parsed.webhookEvents) parsed.webhookEvents = {};
+  return parsed;
+}
+
+function writeStore(store) {
+  const temporaryPath = `${DATA}.tmp`;
+  fs.writeFileSync(temporaryPath, JSON.stringify(store, null, 2), 'utf8');
+  fs.renameSync(temporaryPath, DATA);
+}
+
+function isOwnerDevice(deviceId) {
+  return OWNER_DEVICE_IDS.has(String(deviceId || '').trim());
+}
+
+function accessPayload(user, deviceId) {
+  const ownerExempt = isOwnerDevice(deviceId);
+  const now = Date.now();
+  return {
+    ...user,
+    ownerExempt,
+    trialActive: ownerExempt || Boolean(user.trialUntil && new Date(user.trialUntil).getTime() > now),
+    subscriptionActive: ownerExempt || Boolean(user.activeUntil && new Date(user.activeUntil).getTime() > now),
+    trialUntil: ownerExempt ? OWNER_ACCESS_UNTIL : user.trialUntil,
+    activeUntil: ownerExempt ? OWNER_ACCESS_UNTIL : (user.activeUntil || null)
+  };
+}
+
+function enforceTrialDuration(user) {
+  if (!user || !user.createdAt) return;
   const cap = new Date(new Date(user.createdAt).getTime() + TRIAL_DAYS * 86400000);
-  const current = user.trialUntil ? new Date(user.trialUntil) : cap;
-  إذا لم يكن لدى المستخدم وقت تجريبي محدد أو كان الوقت الحالي أكبر من الوقت المحدد، {
+  const current = user.trialUntil ? new Date(user.trialUntil) : null;
+  if (!current || !Number.isFinite(current.getTime()) || current.getTime() > cap.getTime()) {
     user.trialUntil = cap.toISOString();
   }
 }
 
-app.use(cors());
-app.use(express.json({ limit: '2mb' }));
-
-app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'SurveyQuant backend' });
-});
-
-app.get('/api/config', (req, res) => {
-  res.json({
-    موفر الدفع: 'كاشير'
-    الوضع: KASHIER_MODE،
-    أيام المحاكمة: أيام_المحاكمة،
-    minimumVersionCode: MINIMUM_APP_VERSION_CODE,
-    اسم أحدث إصدار: LATEST_APP_VERSION_NAME,
-    updateUrl: UPDATE_URL,
-    الخطط: الخطط
-  });
-});
-
-app.post('/api/register', (req, res) => {
-  يحاول {
-    const { deviceId, name } = req.body || {};
-    إذا لم يكن معرف الجهاز موجودًا {
-      return res.status(400).json({ error: 'deviceId ظ…ط·ظ„ظˆط¨' });
-    }
-
-    const normalizedId = String(deviceId).trim();
-    const key = 'device:' + normalizedId;
-    const data = read();
-
-    إذا لم يكن المستخدمون موجودين في البيانات [المفتاح] {
-      data.users[key] = {
-        المعرّف: crypto.randomUUID(),
-        الاسم: الاسم || '',
-        معرّف الجهاز: المعرّف المُعَيَّر،
-        تاريخ الإنشاء: تاريخ جديد().toISOString(),
-        trialUntil: new Date(Date.now() + TRIAL_DAYS * 86400000).toISOString(),
-        نشط حتى: لا شيء
-      };
-    } else if (name && !data.users[key].name) {
-      data.users[key].name = name;
-    }
-
-    enforceTrialDuration(data.users[key]);
-    اكتب(البيانات)؛
-    return res.json(accessPayload(data.users[key], normalizedId));
-  } catch (error) {
-    console.error('خطأ في التسجيل:', error);
-    return res.status(500).json({ error: 'طھط¹ط°ط± طھط³ط¬ظٹظ‹ ط§ظ‹ط¬ظ‡ط§ط² طط§ظ‹ظٹظ‹ط§' });
-  }
-});
-
-app.get('/api/status/:deviceId', (req, res) => {
-  يحاول {
-    const deviceId = decodeURIComponent(req.params.deviceId || '').trim();
-    const data = read();
-    const user = data.users['device:' + deviceId];
-    إذا لم يكن هناك مستخدم {
-      return res.status(404).json({ error: 'ط§ظ„ظ…ط³طھط®ط¯ظ… ط؛ظٹط± ظ…ظˆط¬ظˆط¯' });
-    }
-    فرض مدة التجربة (المستخدم)؛
-    اكتب(البيانات)؛
-    return res.json(accessPayload(user, deviceId));
-  } catch (error) {
-    console.error('خطأ في الحالة:', error);
-    return res.status(500).json({ error: 'طھط¹ط°ط± ظ‚ط±ط§ط،ط© طط§ظ„ط© ط§ظ„ط§ط´طھط±ط§ظƒ طط§ظ„ظٹظ‹ط§' });
-  }
-});
-
-دالة تتطلب إعدادات كاشير () {
-  إذا لم يكن مفتاح واجهة برمجة تطبيقات كاشير (KASHIER_API_KEY) أو مفتاح كاشير السري (KASHIER_SECRET_KEY) أو معرّف كاشير (KASHIER_MID) أو عنوان URL لقاعدة البيانات العامة (PUBLIC_BASE_URL) {
-    const error = new Error('ظ„ظ… ظٹطھ… ط¥ط¹ط¯ط§ط¯ ظ…ظپط§طھظٹط كاشير ط £ظˆ PUBLIC_BASE_URL ط¹ظ„ظ‰ ط§ظ„ط³ظٹط±ظپط± ط¨ط¹ط¯');
+function requireKashierConfig() {
+  if (!KASHIER_API_KEY || !KASHIER_SECRET_KEY || !KASHIER_MID || !PUBLIC_BASE_URL) {
+    const error = new Error('لم يتم إعداد مفاتيح Kashier أو PUBLIC_BASE_URL على السيرفر بعد');
     error.statusCode = 503;
-    أسقط خطأً؛
+    throw error;
   }
-}
-
-app.post('/api/kashier/create-session', async (req, res) => {
-  يحاول {
-    const { deviceId, plan } = req.body || {};
-    const normalizedId = String(deviceId || '').trim();
-    const selectedPlan = PLANS[plan];
-    إذا لم يتم تطبيق المعرف الموحد أو لم يتم تحديد الخطة، {
-      return res.status(400)
-    }
-
-    // ينطبق هذا الاستثناء فقط على معرف (معرفات) جهاز المالك المُكوّن بشكل صريح.
-    إذا كان الجهاز هو الجهاز المالك (normalizedId)) {
-      return res.json({
-        حسناً: صحيح،
-        ownerExempt: true,
-        subscriptionActive: true,
-        نشط حتى: وصول المالك حتى
-      });
-    }
-
-    requireKashierConfig();
-    const key = 'device:' + normalizedId;
-    const data = read();
-
-    إذا لم يكن المستخدمون موجودين في البيانات [المفتاح] {
-      data.users[key] = {
-        المعرّف: crypto.randomUUID(),
-        معرّف الجهاز: المعرّف المُعَيَّر،
-        اسم: ''،
-        تاريخ الإنشاء: تاريخ جديد().toISOString(),
-        trialUntil: new Date(Date.now() + TRIAL_DAYS * 86400000).toISOString(),
-        نشط حتى: لا شيء
-      };
-    }
-    enforceTrialDuration(data.users[key]);
-
-    const order = `SQ-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
-    data.payments[order] = {
-      طلب،
-      معرّف الجهاز: المعرّف المُعَيَّر،
-      الاسم: data.users[key].name || '',
-      يخطط،
-      المبلغ: المبلغ المحدد في الخطة،
-      العملة: الجنيه المصري
-      الحالة: 'تم الإنشاء'،
-      تاريخ الإنشاء: تاريخ جديد().toISOString(),
-      معرف المعاملة: لا شيء،
-      تم تفعيل الاشتراك: خطأ
-    };
-    اكتب(البيانات)؛
-
-    const expireAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-    const paymentBody = {
-      تاريخ انتهاء الصلاحية،
-      الحد الأقصى لمحاولات الفشل: 3
-      نوع الدفع: "ائتمان"،
-      المبلغ: selectedPlan.amount.toFixed(2)،
-      العملة: الجنيه المصري
-      طلب،
-      merchantRedirect: encodeURI(
-        `${PUBLIC_BASE_URL}/api/kashier/return?order=${encodeURIComponent(order)}`
-      )
-      العرض: 'ar',
-      النوع: "مرة واحدة"،
-      الطرق المسموح بها: 'card,wallet',
-      redirectMethod: null,
-      معرّف التاجر: KASHIER_MID،
-      failureRedirect: false,
-      لون العلامة التجارية: '#0b7d58'،
-      الطريقة الافتراضية: 'card'،
-      الوصف: `اشتراك SurveyQuant ${selectedPlan.label}`,
-      الالتقاط اليدوي: خطأ،
-      العميل: { المرجع: data.users[key].id },
-      enable3DS: true,
-      رابط الخادم: `${PUBLIC_BASE_URL}/api/kashier/webhook`
-    };
-
-    const response = await fetch(`${KASHIER_API_BASE}/v3/payment/sessions`, {
-      الطريقة: 'POST'
-      الرؤوس: {
-        رقم التفويض: KASHIER_SECRET_KEY،
-        'api-key': KASHIER_API_KEY,
-        نوع المحتوى: تطبيق/json
-      },
-      نص الدفع: JSON.stringify(paymentBody)
-    });
-    const result = await response.json().catch(() => ({}));
-    إذا لم تكن الاستجابة ناجحة (response.ok) أو لم يكن عنوان URL للجلسة موجودًا (result.sessionUrl)، {
-      return res.status(502).json({
-        خطأ: result.message || نتيجة.خطأ || 'طھط¹ط°ط± ط¥ظ†ط´ط§ط، ط¬ظ„ط³ط© ط§ظ„ط¯ظپط¹ ظ…ظ† كاشير',
-        التفاصيل: النتيجة
-      });
-    }
-
-    data.payments[order].sessionId = result._id || null;
-    data.payments[order].sessionUrl = result.sessionUrl;
-    اكتب(البيانات)؛
-    return res.json({
-      حسناً: صحيح،
-      طلب،
-      sessionUrl: result.sessionUrl,
-      المبلغ: المبلغ المحدد في الخطة،
-      العملة: الجنيه المصري
-    });
-  } catch (error) {
-    console.error('خطأ في إنشاء الجلسة:', error);
-    return res.status(error.statusCode || 500).json({ error: error.message || 'ط®ط·ط £ ظپظٹ ط¥ظ†ط´ط§ط، ط§ظ„ط¯ظپط¹' });
-  }
-});
-
-app.get('/api/kashier/status', (req, res) => {
-  يحاول {
-    const deviceId = String(req.query.deviceId || '').trim();
-    const order = String(req.query.order || '').trim();
-    إذا كان الجهاز هو الجهاز المالك (معرف الجهاز) {
-      return res.json({
-        ownerExempt: true,
-        حالة الدفع: 'معفى من الدفع'،
-        subscriptionActive: true,
-        نشط حتى: وصول المالك حتى
-      });
-    }
-
-    const data = read();
-    const payment = data.payments[order];
-    const user = data.users['device:' + deviceId];
-    إذا لم يتم الدفع أو لم يكن هناك مستخدم أو لم يكن معرف الجهاز الخاص بالدفع مطابقًا لمعرف الجهاز، {
-      return res.status(404).json({ error: 'ط¹ظ…ظ„ظٹط© ط§ظ„ط¯ظپط¹ ط؛ظٹط± ظ…ظˆط¬ظˆط¯ط©' });
-    }
-    const now = Date.now();
-    return res.json({
-      حالة الدفع: payment.status,
-      معرف المعاملة: payment.transactionId,
-      subscriptionActive: !!user.activeUntil && new Date(user.activeUntil).getTime() > now,
-      activeUntil: user.activeUntil || null
-    });
-  } catch (error) {
-    console.error('خطأ في حالة الدفع:', error);
-    return res.status(500).json({ error: 'طھط¹ط°ط± ظ‚ط±ط§ط،ط© طط§ظ‹ط© ط§ظ‹ط¯ظپط¹ طط§ظ‹ظٹظ‹ط§' });
-  }
-});
-
-دالة التحقق من Webhook(البيانات، توقيع الرأس) {
-  إذا لم يكن مفتاح واجهة برمجة تطبيقات KASHIER موجودًا، أو لم يكن توقيع الرأس موجودًا، أو لم تكن البيانات موجودة، أو لم تكن مفاتيح التوقيع الخاصة بالبيانات عبارة عن مصفوفة، {
-    أعد القيمة خطأ؛
-  }
-  const keys = [...data.signatureKeys].sort();
-  const payload = keys
-    .map(key => `${key}=${encodeURIComponent(data[key] == null ? '' : String(data[key]))}`)
-    .ينضم('&')؛
-  const digest = crypto.createHmac('sha256', KASHIER_API_KEY).update(payload).digest('hex');
-  const provided = String(headerSignature).toLowerCase();
-  const expected = digest.toLowerCase();
-  return expected.length === provided.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(supplied));
 }
 
 async function requestAutomaticRefund(store, payment, webhookData, reason) {
-  // لا ترسل أبدًا طلب استرداد مكررًا دون تفكير.
-  const alreadyStarted = ['REQUESTED', 'SUCCESS', 'PENDING', 'MANUAL_REVIEW_REQUIRED', 'PENDING_REVIEW']
-    .includes(String(payment.refundStatus || '').toUpperCase());
-  إذا (بدأ بالفعل) فارجع؛
+  const currentStatus = String(payment.refundStatus || '').toUpperCase();
+  if (['REQUESTED', 'SUCCESS', 'PENDING', 'FAILURE', 'MANUAL_REVIEW_REQUIRED', 'PENDING_REVIEW'].includes(currentStatus)) {
+    return;
+  }
 
   const providerOrderId = String(
-    (بيانات webhook && بيانات webhook.kashierOrderId) || payment.kashierOrderId || ''
-  ).تقليم()؛
+    (webhookData && webhookData.kashierOrderId) || payment.kashierOrderId || ''
+  ).trim();
   const transactionId = String(
-    (بيانات webhook && webhookData.transactionId) || payment.transactionId || ''
-  ).تقليم()؛
+    (webhookData && webhookData.transactionId) || payment.transactionId || ''
+  ).trim();
 
   payment.kashierOrderId = providerOrderId || payment.kashierOrderId || null;
   payment.refundReason = reason;
   payment.refundRequestedAt = new Date().toISOString();
 
-  إذا لم يكن مفتاح المحاسب السري موجودًا أو لم يكن معرف طلب الموفر موجودًا،
+  if (!KASHIER_SECRET_KEY || !providerOrderId) {
     payment.refundStatus = 'MANUAL_REVIEW_REQUIRED';
     payment.refundError = !KASHIER_SECRET_KEY
-      لم يتم تكوين مفتاح KASHIER_SECRET_KEY.
-      : 'رقم تعريف طلب أمين الصندوق مفقود من سجل الويب هوك/الدفع'؛
-    اكتب(خزن)؛
-    console.error('تعذر إرسال رد الأموال تلقائيًا:', payment.order, payment.refundError);
-    يعود؛
+      ? 'KASHIER_SECRET_KEY is not configured.'
+      : 'Kashier order ID is missing from the payment/webhook record.';
+    writeStore(store);
+    console.error('Automatic refund requires manual review:', payment.order, payment.refundError);
+    return;
   }
 
-  // احتفظ بعلامة الطلب قبل استدعاء كاشير لتقليل مخاطر الاسترداد المكرر.
+  // Persist the request marker before contacting Kashier to reduce duplicate refund attempts.
   payment.refundStatus = 'REQUESTED';
   payment.refundError = null;
-  اكتب(خزن)؛
+  writeStore(store);
 
-  يحاول {
+  try {
     const refundBody = {
       apiOperation: 'REFUND',
-      السبب: "استرداد تلقائي من SurveyQuant: فشل تفعيل الاشتراك".
+      reason: 'SurveyQuant automatic refund: subscription activation failed',
       transaction: transactionId ? { targetTransactionId: transactionId } : {}
     };
     const response = await fetch(
       `${KASHIER_REFUND_API_BASE}/v3/orders/${encodeURIComponent(providerOrderId)}`,
       {
-        الطريقة: 'PUT'،
-        الرؤوس: {
-          رقم التفويض: KASHIER_SECRET_KEY،
-          مقبول: 'application/json'،
-          نوع المحتوى: تطبيق/json
+        method: 'PUT',
+        headers: {
+          Authorization: KASHIER_SECRET_KEY,
+          accept: 'application/json',
+          'Content-Type': 'application/json'
         },
-        نص الاستجابة: JSON.stringify(refundBody)
+        body: JSON.stringify(refundBody)
       }
     );
     const result = await response.json().catch(() => ({}));
@@ -382,139 +163,351 @@ async function requestAutomaticRefund(store, payment, webhookData, reason) {
       result.status || (result.response && result.response.status) || ''
     ).toUpperCase();
 
-    إذا كانت الاستجابة صحيحة (response.ok) وكانت حالة الموفر تتضمن ['SUCCESS', 'PENDING', 'FAILURE'] {
+    if (response.ok && ['SUCCESS', 'PENDING', 'FAILURE'].includes(providerStatus)) {
       payment.refundStatus = providerStatus;
-    } آخر {
+    } else {
       payment.refundStatus = 'PENDING_REVIEW';
       payment.refundError = `Kashier refund API returned HTTP ${response.status}`;
     }
     payment.refundHttpStatus = response.status;
     payment.refundResponse = result;
     payment.refundUpdatedAt = new Date().toISOString();
-    اكتب(خزن)؛
+    writeStore(store);
 
-    إذا لم تكن حالة استرداد الدفعة تساوي "نجاح" {
-      console.error('يحتاج رد الأموال التلقائي إلى متابعة:', payment.order, payment.refundStatus);
+    if (payment.refundStatus !== 'SUCCESS') {
+      console.error('Automatic refund follow-up required:', payment.order, payment.refundStatus);
     }
   } catch (error) {
-    // لا تقم بإعادة محاولة الطلب غير المؤكد تلقائيًا: يجب تجنب عمليات الاسترداد المكررة.
+    // Do not blindly retry an uncertain request: the provider may already have processed it.
     payment.refundStatus = 'PENDING_REVIEW';
-    payment.refundError = error.message || 'حدث خطأ في الشبكة أثناء طلب استرداد الأموال';
+    payment.refundError = error.message || 'Network error while requesting refund';
     payment.refundUpdatedAt = new Date().toISOString();
-    اكتب(خزن)؛
-    console.error('فشل طلب الاسترداد التلقائي:', payment.order, payment.refundError);
+    writeStore(store);
+    console.error('Automatic refund request failed:', payment.order, payment.refundError);
   }
 }
 
+function verifyWebhook(data, headerSignature) {
+  if (!KASHIER_API_KEY || !headerSignature || !data || !Array.isArray(data.signatureKeys)) {
+    return false;
+  }
+  const keys = [...data.signatureKeys].sort();
+  const payload = keys
+    .map(key => `${key}=${encodeURIComponent(data[key] == null ? '' : String(data[key]))}`)
+    .join('&');
+  const digest = crypto.createHmac('sha256', KASHIER_API_KEY).update(payload).digest('hex');
+  const supplied = String(headerSignature).toLowerCase();
+  const expected = digest.toLowerCase();
+  return expected.length === supplied.length &&
+    crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(supplied));
+}
+
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+
+app.get('/', (_req, res) => {
+  res.set('X-SurveyQuant-Backend', 'owner-device-allowlist-v1');
+  res.json({
+    ok: true,
+    service: 'SurveyQuant backend',
+    revision: 'owner-device-allowlist-v1',
+    endpoints: ['/health', '/api/config', '/api/register', '/api/status/:deviceId']
+  });
+});
+
+app.get('/health', (_req, res) => {
+  res.set('X-SurveyQuant-Backend', 'owner-device-allowlist-v1');
+  res.json({
+    ok: true,
+    service: 'SurveyQuant backend',
+    revision: 'owner-device-allowlist-v1',
+    provider: 'Kashier',
+    mode: KASHIER_MODE
+  });
+});
+
+app.get('/api/config', (_req, res) => {
+  res.set('X-SurveyQuant-Backend', 'owner-device-allowlist-v1');
+  res.json({
+    paymentProvider: 'Kashier',
+    mode: KASHIER_MODE,
+    trialDays: TRIAL_DAYS,
+    minimumVersionCode: MINIMUM_APP_VERSION_CODE,
+    latestVersionName: LATEST_APP_VERSION_NAME,
+    updateUrl: UPDATE_URL,
+    plans: PLANS
+  });
+});
+
+app.post('/api/register', (req, res) => {
+  try {
+    const { deviceId, name } = req.body || {};
+    if (!deviceId) return res.status(400).json({ error: 'deviceId مطلوب' });
+
+    const normalizedId = String(deviceId).trim();
+    const key = `device:${normalizedId}`;
+    const store = readStore();
+
+    if (!store.users[key]) {
+      store.users[key] = {
+        id: crypto.randomUUID(),
+        name: name || '',
+        deviceId: normalizedId,
+        createdAt: new Date().toISOString(),
+        trialUntil: new Date(Date.now() + TRIAL_DAYS * 86400000).toISOString(),
+        activeUntil: null
+      };
+    } else if (name && !store.users[key].name) {
+      store.users[key].name = name;
+    }
+
+    enforceTrialDuration(store.users[key]);
+    writeStore(store);
+    return res.json(accessPayload(store.users[key], normalizedId));
+  } catch (error) {
+    console.error('Registration error:', error);
+    return res.status(500).json({ error: 'تعذر تسجيل الجهاز حاليًا' });
+  }
+});
+
+app.get('/api/status/:deviceId', (req, res) => {
+  try {
+    const deviceId = decodeURIComponent(req.params.deviceId || '').trim();
+    const store = readStore();
+    const key = `device:${deviceId}`;
+    let user = store.users[key];
+
+    if (!user && isOwnerDevice(deviceId)) {
+      user = store.users[key] = {
+        id: crypto.randomUUID(),
+        name: '',
+        deviceId,
+        createdAt: new Date().toISOString(),
+        trialUntil: new Date(Date.now() + TRIAL_DAYS * 86400000).toISOString(),
+        activeUntil: null
+      };
+    }
+    if (!user) return res.status(404).json({ error: 'المستخدم غير موجود' });
+
+    enforceTrialDuration(user);
+    writeStore(store);
+    return res.json(accessPayload(user, deviceId));
+  } catch (error) {
+    console.error('Status error:', error);
+    return res.status(500).json({ error: 'تعذرت قراءة حالة الاشتراك حاليًا' });
+  }
+});
+
+app.post('/api/kashier/create-session', async (req, res) => {
+  try {
+    const { deviceId, plan } = req.body || {};
+    const normalizedId = String(deviceId || '').trim();
+    const selectedPlan = PLANS[plan];
+
+    if (!normalizedId || !selectedPlan) {
+      return res.status(400).json({ error: 'بيانات الحساب أو الباقة غير صحيحة' });
+    }
+
+    if (isOwnerDevice(normalizedId)) {
+      return res.json({
+        ok: true,
+        ownerExempt: true,
+        trialActive: true,
+        subscriptionActive: true,
+        activeUntil: OWNER_ACCESS_UNTIL
+      });
+    }
+
+    requireKashierConfig();
+    const key = `device:${normalizedId}`;
+    const store = readStore();
+
+    if (!store.users[key]) {
+      store.users[key] = {
+        id: crypto.randomUUID(),
+        name: '',
+        deviceId: normalizedId,
+        createdAt: new Date().toISOString(),
+        trialUntil: new Date(Date.now() + TRIAL_DAYS * 86400000).toISOString(),
+        activeUntil: null
+      };
+    }
+    enforceTrialDuration(store.users[key]);
+
+    const order = `SQ-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    store.payments[order] = {
+      order,
+      deviceId: normalizedId,
+      name: store.users[key].name || '',
+      plan,
+      amount: selectedPlan.amount,
+      currency: 'EGP',
+      status: 'CREATED',
+      createdAt: new Date().toISOString(),
+      transactionId: null,
+      subscriptionActivated: false
+    };
+    writeStore(store);
+
+    const expireAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    const paymentBody = {
+      expireAt,
+      maxFailureAttempts: 3,
+      paymentType: 'credit',
+      amount: selectedPlan.amount.toFixed(2),
+      currency: 'EGP',
+      order,
+      merchantRedirect: encodeURI(`${PUBLIC_BASE_URL}/api/kashier/return?order=${encodeURIComponent(order)}`),
+      display: 'ar',
+      type: 'one-time',
+      allowedMethods: 'card,wallet',
+      redirectMethod: null,
+      merchantId: KASHIER_MID,
+      failureRedirect: false,
+      brandColor: '#0b7d58',
+      defaultMethod: 'card',
+      description: `SurveyQuant ${selectedPlan.label} subscription`,
+      manualCapture: false,
+      customer: { reference: store.users[key].id },
+      enable3DS: true,
+      serverWebhook: `${PUBLIC_BASE_URL}/api/kashier/webhook`
+    };
+
+    const response = await fetch(`${KASHIER_API_BASE}/v3/payment/sessions`, {
+      method: 'POST',
+      headers: {
+        Authorization: KASHIER_SECRET_KEY,
+        'api-key': KASHIER_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(paymentBody)
+    });
+    const result = await response.json().catch(() => ({}));
+
+    if (!response.ok || !result.sessionUrl) {
+      return res.status(502).json({
+        error: result.message || result.error || 'تعذر إنشاء جلسة الدفع من Kashier',
+        details: result
+      });
+    }
+
+    store.payments[order].sessionId = result._id || null;
+    store.payments[order].sessionUrl = result.sessionUrl;
+    writeStore(store);
+    return res.json({ ok: true, order, sessionUrl: result.sessionUrl, amount: selectedPlan.amount, currency: 'EGP' });
+  } catch (error) {
+    console.error('Create-session error:', error);
+    return res.status(error.statusCode || 500).json({ error: error.message || 'خطأ في إنشاء الدفع' });
+  }
+});
+
+app.get('/api/kashier/status', (req, res) => {
+  try {
+    const deviceId = String(req.query.deviceId || '').trim();
+    const order = String(req.query.order || '').trim();
+
+    if (isOwnerDevice(deviceId)) {
+      return res.json({
+        paymentStatus: 'OWNER_EXEMPT',
+        ownerExempt: true,
+        subscriptionActive: true,
+        activeUntil: OWNER_ACCESS_UNTIL
+      });
+    }
+
+    const store = readStore();
+    const payment = store.payments[order];
+    const user = store.users[`device:${deviceId}`];
+    if (!payment || !user || payment.deviceId !== deviceId) {
+      return res.status(404).json({ error: 'عملية الدفع غير موجودة' });
+    }
+
+    const now = Date.now();
+    return res.json({
+      paymentStatus: payment.status,
+      transactionId: payment.transactionId || null,
+      subscriptionActive: Boolean(user.activeUntil && new Date(user.activeUntil).getTime() > now),
+      activeUntil: user.activeUntil || null
+    });
+  } catch (error) {
+    console.error('Payment status error:', error);
+    return res.status(500).json({ error: 'تعذرت قراءة حالة الدفع حاليًا' });
+  }
+});
+
 app.post('/api/kashier/webhook', async (req, res) => {
-  يحاول {
+  try {
     const body = req.body || {};
     const data = body.data || {};
     const signature = req.get('x-kashier-signature');
-
-    إذا لم يتم التحقق من صحة Webhook(البيانات، التوقيع) {
-      return res.status(401).send('توقيع غير صالح');
-    }
+    if (!verifyWebhook(data, signature)) return res.status(401).send('invalid signature');
 
     const eventId = data.transactionId ||
       `${body.event || 'event'}:${data.merchantOrderId || data.orderReference || ''}:${data.status || ''}`;
-    const store = read();
-    store.webhookEvents = store.webhookEvents || {};
-
-    إذا كان (store.webhookEvents[eventId]) {
-      return res.status(200).send('تمت المعالجة بالفعل');
-    }
+    const store = readStore();
+    if (store.webhookEvents[eventId]) return res.status(200).send('Already processed');
 
     const order = data.merchantOrderId || data.orderReference || '';
     const payment = store.payments[order];
     let needsRefund = false;
-
-    إذا (تم الدفع) {
+    if (payment) {
+      payment.status = data.status || 'UNKNOWN';
+      payment.transactionId = data.transactionId || payment.transactionId || null;
       payment.kashierOrderId = data.kashierOrderId || payment.kashierOrderId || null;
+      payment.method = data.method || data.paymentMethod || payment.method || null;
+      payment.webhookAt = new Date().toISOString();
 
-      // التعامل مع إشعارات استرداد الأموال بشكل منفصل حتى لا تستبدل بيانات معاملات الدفع.
-      إذا كان (body.event === 'refund' || body.event === 'partial_refund') {
-        payment.refundStatus = String(data.status || 'UNKNOWN').toUpperCase();
-        payment.refundTransactionId = data.transactionId || payment.refundTransactionId || null;
-        payment.refundWebhookAt = new Date().toISOString();
-      } آخر {
-        payment.status = data.status || 'UNKNOWN';
-        payment.transactionId = data.transactionId || payment.transactionId || null;
-        payment.kashierOrderId = data.kashierOrderId || payment.kashierOrderId || null;
-        payment.method = data.method || data.paymentMethod || payment.method || null;
-        payment.webhookAt = new Date().toISOString();
-
-        إذا كانت حالة البيانات تساوي 'نجاح' ولم يتم تفعيل الاشتراك في الدفع، {
-          const user = store.users['device:' + payment.deviceId];
-          const plan = PLANS[payment.plan];
-
-          إذا كان (المستخدم && الخطة) {
-            const activeUntil = user.activeUntil ? new Date(user.activeUntil).getTime() : 0;
-            const base = activeUntil > Date.now() ? activeUntil : Date.now();
-            user.activeUntil = new Date(base + plan.days * 86400000).toISOString();
-            payment.subscriptionActivated = true;
-            payment.activatedAt = new Date().toISOString();
-            payment.activationError = null;
-          } آخر {
-            // تم الدفع بنجاح ولكن لا يوجد مستخدم/خطة محلية صالحة للتفعيل.
-            payment.activationError = !user ? 'لم يتم العثور على سجل المستخدم بعد إتمام عملية الدفع بنجاح' : 'خطة الاشتراك مفقودة أو غير صالحة';
-            needsRefund = true;
-          }
+      if (data.status === 'SUCCESS' && !payment.subscriptionActivated) {
+        const user = store.users[`device:${payment.deviceId}`];
+        const selectedPlan = PLANS[payment.plan];
+        if (user && selectedPlan) {
+          const currentEnd = user.activeUntil ? new Date(user.activeUntil).getTime() : 0;
+          const base = currentEnd > Date.now() ? currentEnd : Date.now();
+          user.activeUntil = new Date(base + selectedPlan.days * 86400000).toISOString();
+          payment.subscriptionActivated = true;
+          payment.activatedAt = new Date().toISOString();
+          payment.activationError = null;
+        } else {
+          payment.activationError = !user ? 'User record missing after successful payment' : 'Subscription plan missing or invalid';
+          needsRefund = true;
+          console.error('Payment activation failed; automatic refund will be requested:', order, payment.activationError);
         }
       }
     } else if (data.status === 'SUCCESS' && String(order).startsWith('SQ-')) {
-      // الطلب ينتمي إلى مساحة اسم هذا التطبيق، ولكن سجل الدفع المحلي الخاص به مفقود.
-      // احتفظ بسجل تدقيق؛ بدون السجل المحلي الأصلي، يتم توجيه العملية إلى مراجعة يدوية.
       store.unmatchedSuccessfulPayments = store.unmatchedSuccessfulPayments || {};
       store.unmatchedSuccessfulPayments[eventId] = {
-        طلب،
+        order,
         kashierOrderId: data.kashierOrderId || null,
-        معرف المعاملة: data.transactionId || null,
-        الحالة: بيانات الحالة،
+        transactionId: data.transactionId || null,
+        status: data.status,
         receivedAt: new Date().toISOString(),
-        الإجراء: 'المراجعة اليدوية مطلوبة: سجل الدفع المحلي مفقود'
+        action: 'Manual review required: local payment record missing'
       };
-      console.error('لا يوجد سجل محلي للدفعة الناجحة:', order);
+      console.error('No local record for successful payment:', order);
     }
 
     store.webhookEvents[eventId] = new Date().toISOString();
-    اكتب(خزن)؛
+    writeStore(store);
 
-    إذا (تم الدفع و) كان هناك حاجة إلى استرداد المبلغ) {
-      انتظر طلب الاسترداد التلقائي (المتجر، الدفع، البيانات، خطأ التفعيل).
+    if (payment && needsRefund) {
+      await requestAutomaticRefund(store, payment, data, payment.activationError || 'Subscription activation failed');
     }
-
     return res.status(200).send('OK');
   } catch (error) {
-    console.error('خطأ في webhook:', error);
-    return res.status(500).send('خطأ في معالجة webhook');
+    console.error('Webhook error:', error);
+    return res.status(500).send('Webhook processing error');
   }
 });
 
-app.get('/api/kashier/return', (req, res) => {
+app.get('/api/kashier/return', (_req, res) => {
   res.status(200).send(`<!doctype html>
 <html lang="ar" dir="rtl">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SurveyQuant</title>
-</head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SurveyQuant</title></head>
 <body style="font-family:Arial;text-align:center;padding:40px">
-<h2>طھظ…طھ ط§ظ„ط¹ظˆط¯ط© ظ…ظ† طμظپطط© ط§ظ„ط¯ظپط¹</h2>
-<p>ط§ط±ط¬ط¹ ط¥ظ„ظ‰ طھط·ط¨ظٹظ‚ ظ…ظƒطھط¨ ظپظ†ظٹ ظ…ط³ط§طط©. ط¹ظ…ظ„ظٹط© ط§ظ„ط¯ظپط¹ ظ…ظ† كاشير.</p>
-<p>ظٹظ…ظƒظ†ظƒ ط¥ط;ظ„ط§ظ‚ ظ‡ط°ظ‡ ط§ظ„طμظپطط©.</p>
-</body>
-</html>`);
-});
-
-app.get('/health', (req, res) => {
-  res.json({
-    حسناً: صحيح،
-    الخدمة: 'SurveyQuant backend',
-    مراجعة: 'owner-device-allowlist-v1'،
-    المزوّد: 'كاشير'
-    الوضع: وضع الكاشير
-  });
+<h2>تمت العودة من صفحة الدفع</h2>
+<p>ارجع إلى تطبيق مكتب فني مساحة. يتم التفعيل بعد تأكيد عملية الدفع من Kashier.</p>
+<p>يمكنك إغلاق هذه الصفحة.</p>
+</body></html>`);
 });
 
 app.listen(PORT, () => {
