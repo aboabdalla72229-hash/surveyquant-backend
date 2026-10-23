@@ -31,7 +31,7 @@ const KASHIER_API_KEY = process.env.KASHIER_API_KEY || '';
 const KASHIER_SECRET_KEY = process.env.KASHIER_SECRET_KEY || '';
 const KASHIER_MID = process.env.KASHIER_MID || '';
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
-const TRIAL_DAYS = 3;
+const TRIAL_DAYS = Math.max(1, Math.floor(Number(process.env.TRIAL_DAYS || 7)));
 
 // Only explicitly listed device IDs are exempt from payment.
 const OWNER_DEVICE_IDS = new Set(
@@ -95,7 +95,10 @@ function enforceTrialDuration(user) {
   if (!user || !user.createdAt) return;
   const cap = new Date(new Date(user.createdAt).getTime() + TRIAL_DAYS * 86400000);
   const current = user.trialUntil ? new Date(user.trialUntil) : null;
-  if (!current || !Number.isFinite(current.getTime()) || current.getTime() > cap.getTime()) {
+  // Reconcile old short trial records to the current configured cap. This extends
+  // earlier 3-day trial records to createdAt + TRIAL_DAYS, never beyond that date.
+  if (!current || !Number.isFinite(current.getTime()) ||
+      Math.abs(current.getTime() - cap.getTime()) > 1000) {
     user.trialUntil = cap.toISOString();
   }
 }
@@ -442,12 +445,18 @@ app.post('/api/kashier/webhook', async (req, res) => {
     const signature = req.get('x-kashier-signature');
     if (!verifyWebhook(data, signature)) return res.status(401).send('invalid signature');
 
-    const eventId = data.transactionId ||
-      `${body.event || 'event'}:${data.merchantOrderId || data.orderReference || ''}:${data.status || ''}`;
+    // Kashier's merchantOrderId is a provider-side ID. orderReference is the
+    // merchant's "order" value from create-session and must be matched first.
+    const order = String(data.orderReference || data.merchantOrderId || '').trim();
+    const eventId = [
+      body.event || 'event',
+      data.transactionId || 'no-transaction',
+      order || 'no-order',
+      data.status || 'UNKNOWN'
+    ].join(':');
     const store = readStore();
     if (store.webhookEvents[eventId]) return res.status(200).send('Already processed');
 
-    const order = data.merchantOrderId || data.orderReference || '';
     const payment = store.payments[order];
     let needsRefund = false;
     if (payment) {
