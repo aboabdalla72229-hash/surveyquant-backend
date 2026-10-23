@@ -1,0 +1,271 @@
+name: Repair SurveyQuant Kashier payment activation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/fix-kashier-payment-flow.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  repair-and-test:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out backend repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install backend dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Fix webhook order mapping and trial reconciliation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("server.js")
+          source = path.read_text(encoding="utf-8")
+          original = source
+
+          # Keep the advertised 7-day trial configurable; default to 7 days.
+          source, n = re.subn(
+              r"const TRIAL_DAYS\s*=\s*3\s*;",
+              "const TRIAL_DAYS = Math.max(1, Math.floor(Number(process.env.TRIAL_DAYS || 7)));",
+              source,
+              count=1,
+          )
+          if n == 0 and not re.search(r"const TRIAL_DAYS\s*=\s*Math\.max\(1, Math\.floor\(Number\(process\.env\.TRIAL_DAYS\s*\|\|\s*7\)\)\)\s*;", source):
+              raise SystemExit("ERROR: could not safely find TRIAL_DAYS declaration")
+
+          old_trial = '''  const current = user.trialUntil ? new Date(user.trialUntil) : null;
+            if (!current || !Number.isFinite(current.getTime()) || current.getTime() > cap.getTime()) {
+              user.trialUntil = cap.toISOString();
+            }'''
+          new_trial = '''  const current = user.trialUntil ? new Date(user.trialUntil) : null;
+            // Reconcile old short trial records to the current configured cap. This extends
+            // earlier 3-day trial records to createdAt + TRIAL_DAYS, never beyond that date.
+            if (!current || !Number.isFinite(current.getTime()) ||
+                Math.abs(current.getTime() - cap.getTime()) > 1000) {
+              user.trialUntil = cap.toISOString();
+            }'''
+          if old_trial in source:
+              source = source.replace(old_trial, new_trial, 1)
+          elif "Math.abs(current.getTime() - cap.getTime()) > 1000" not in source:
+              raise SystemExit("ERROR: could not safely patch enforceTrialDuration")
+
+          webhook_start = "    const eventId = data.transactionId ||"
+          webhook_marker = "app.post('/api/kashier/webhook'"
+          marker_index = source.find(webhook_marker)
+          if marker_index < 0:
+              raise SystemExit("ERROR: Kashier webhook route not found")
+
+          start = source.find(webhook_start, marker_index)
+          if start >= 0:
+              end_marker = "    let needsRefund = false;"
+              end = source.find(end_marker, start)
+              if end < 0:
+                  raise SystemExit("ERROR: webhook mapping block end not found")
+              corrected = '''    // Kashier's merchantOrderId is a provider-side ID. orderReference is the
+              // merchant's "order" value from create-session and must be matched first.
+              const order = String(data.orderReference || data.merchantOrderId || '').trim();
+              const eventId = [
+                body.event || 'event',
+                data.transactionId || 'no-transaction',
+                order || 'no-order',
+                data.status || 'UNKNOWN'
+              ].join(':');
+              const store = readStore();
+              if (store.webhookEvents[eventId]) return res.status(200).send('Already processed');
+
+              const payment = store.payments[order];
+          '''
+              source = source[:start] + corrected + source[end:]
+          elif not (
+              "const order = String(data.orderReference || data.merchantOrderId || '').trim();" in source
+              and "data.status || 'UNKNOWN'" in source
+              and "].join(':')" in source
+          ):
+              raise SystemExit("ERROR: webhook order matching is neither original nor already fixed")
+
+          if source == original:
+              print("No source changes were needed; fixes are already applied.")
+          else:
+              path.write_text(source, encoding="utf-8")
+              print("PASS: updated server.js webhook mapping and 7-day trial reconciliation.")
+          PY
+
+      - name: Check JavaScript syntax
+        run: node --check server.js
+
+      - name: Run end-to-end payment webhook regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p scripts
+          cat > scripts/test-kashier-payment-flow.js <<'JS'
+          'use strict';
+          const assert = require('node:assert/strict');
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const { spawn } = require('node:child_process');
+
+          const API_KEY = 'test-payment-api-key-for-regression-only';
+          const deviceId = 'SQ-PAYMENT-REGRESSION-DEVICE';
+          const order = 'SQ-REGRESSION-ORDER-001';
+          const now = Date.now();
+          const createdAt = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+          const oldThreeDayTrial = new Date(now + 2 * 24 * 60 * 60 * 1000).toISOString();
+          const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'surveyquant-kashier-test-'));
+          const dataPath = path.join(tempDir, 'data.json');
+          const port = 18000 + Math.floor(Math.random() * 10000);
+          const store = {
+            users: {
+              ['device:' + deviceId]: {
+                id: 'test-user-id', name: 'Regression Test', deviceId,
+                createdAt, trialUntil: oldThreeDayTrial, activeUntil: null
+              }
+            },
+            payments: {
+              [order]: {
+                order, deviceId, plan: 'monthly', amount: 55, currency: 'EGP',
+                status: 'CREATED', createdAt: new Date(now).toISOString(),
+                transactionId: null, subscriptionActivated: false
+              }
+            },
+            webhookEvents: {}
+          };
+          fs.writeFileSync(dataPath, JSON.stringify(store, null, 2));
+
+          const child = spawn(process.execPath, ['server.js'], {
+            cwd: process.cwd(),
+            env: {
+              ...process.env,
+              PORT: String(port),
+              SURVEYQUANT_DATA_DIR: tempDir,
+              KASHIER_API_KEY: API_KEY,
+              KASHIER_SECRET_KEY: 'unused-for-this-webhook-test',
+              KASHIER_MID: 'MID-TEST-ONLY',
+              PUBLIC_BASE_URL: 'https://example.invalid'
+            },
+            stdio: ['ignore', 'pipe', 'pipe']
+          });
+          let logs = '';
+          child.stdout.on('data', x => { logs += x.toString(); });
+          child.stderr.on('data', x => { logs += x.toString(); });
+          const base = 'http://127.0.0.1:' + port;
+
+          async function waitForServer() {
+            for (let i = 0; i < 60; i++) {
+              if (child.exitCode !== null) throw new Error('backend exited early: ' + logs);
+              try {
+                const r = await fetch(base + '/health');
+                if (r.ok) return;
+              } catch (_) {}
+              await new Promise(resolve => setTimeout(resolve, 250));
+            }
+            throw new Error('backend did not start: ' + logs);
+          }
+
+          function signData(data) {
+            const keys = [...data.signatureKeys].sort();
+            const payload = keys.map(k => k + '=' + encodeURIComponent(data[k] == null ? '' : String(data[k]))).join('&');
+            return crypto.createHmac('sha256', API_KEY).update(payload).digest('hex');
+          }
+
+          async function sendWebhook(status) {
+            const data = {
+              merchantOrderId: 'KASHIER-INTERNAL-ID-DO-NOT-MATCH-LOCAL-ORDER',
+              orderReference: order,
+              transactionId: 'TX-REGRESSION-SAME-ID',
+              status,
+              signatureKeys: ['merchantOrderId', 'orderReference', 'status', 'transactionId']
+            };
+            const response = await fetch(base + '/api/kashier/webhook', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-kashier-signature': signData(data) },
+              body: JSON.stringify({ event: 'pay', data })
+            });
+            return { response, body: await response.text() };
+          }
+
+          (async () => {
+            try {
+              await waitForServer();
+              const config = await (await fetch(base + '/api/config')).json();
+              assert.equal(config.trialDays, 7, 'backend must expose the advertised 7-day trial');
+
+              const statusResponse = await fetch(base + '/api/status/' + encodeURIComponent(deviceId));
+              assert.equal(statusResponse.status, 200);
+              const userAfterTrialReconcile = await statusResponse.json();
+              const cap = new Date(createdAt).getTime() + 7 * 24 * 60 * 60 * 1000;
+              assert.ok(Math.abs(new Date(userAfterTrialReconcile.trialUntil).getTime() - cap) < 1500,
+                'existing old trial record should reconcile to createdAt + 7 days');
+
+              const failed = await sendWebhook('FAILURE');
+              assert.equal(failed.response.status, 200, 'signed failure webhook should be acknowledged');
+              let dataAfter = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+              assert.equal(dataAfter.payments[order].subscriptionActivated, false,
+                'failure event must not activate subscription');
+
+              const success = await sendWebhook('SUCCESS');
+              assert.equal(success.response.status, 200, 'later success with same transaction id should be processed');
+              dataAfter = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+              assert.equal(dataAfter.payments[order].status, 'SUCCESS');
+              assert.equal(dataAfter.payments[order].subscriptionActivated, true,
+                'merchant orderReference must map to the local payment and activate access');
+              assert.ok(new Date(dataAfter.users['device:' + deviceId].activeUntil).getTime() > Date.now(),
+                'successful payment should set activeUntil');
+              const activeUntil = dataAfter.users['device:' + deviceId].activeUntil;
+
+              const duplicate = await sendWebhook('SUCCESS');
+              assert.equal(duplicate.response.status, 200);
+              assert.equal(duplicate.body, 'Already processed');
+              dataAfter = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+              assert.equal(dataAfter.users['device:' + deviceId].activeUntil, activeUntil,
+                'duplicate successful webhook must not extend the subscription twice');
+              console.log('PASS: 7-day trial reconciliation, correct orderReference mapping, failure→success processing, and webhook idempotency.');
+            } finally {
+              if (child.exitCode === null) {
+                await new Promise(resolve => {
+                  const timeout = setTimeout(() => {
+                    child.kill('SIGKILL');
+                    resolve();
+                  }, 2500);
+                  child.once('exit', () => { clearTimeout(timeout); resolve(); });
+                  child.kill('SIGTERM');
+                });
+              }
+              fs.rmSync(tempDir, { recursive: true, force: true });
+            }
+          })().catch(error => { console.error(error); process.exitCode = 1; });
+          JS
+          node scripts/test-kashier-payment-flow.js
+
+      - name: Commit backend fix for Railway deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js scripts/test-kashier-payment-flow.js
+          if git diff --cached --quiet; then
+            echo "No changes to commit; backend already has the tested fix."
+          else
+            git commit -m "Fix Kashier webhook activation and 7-day trial"
+            git push origin HEAD:main
+          fi
